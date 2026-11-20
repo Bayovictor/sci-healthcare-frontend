@@ -44,6 +44,8 @@ export type Sep7FundPanelProps = {
   secret: string;
   /** Connected wallet, offered as the default payer. */
   walletAddress: string | null;
+  /** Optional per-voucher dispute window in seconds (contracts #123). */
+  disputeWindow?: number;
   /** Called once the payment is confirmed, to refresh voucher lists. */
   onFunded: (result: { hash: string }) => void;
 };
@@ -58,6 +60,7 @@ export function Sep7FundPanel({
   identifier,
   secret,
   walletAddress,
+  disputeWindow,
   onFunded,
 }: Sep7FundPanelProps) {
   const [payerDraft, setPayerDraft] = useState<string | null>(null);
@@ -158,6 +161,7 @@ export function Sep7FundPanel({
           serviceCode,
           amount,
           expiresAt: expiresAtSeconds,
+          ...(disputeWindow !== undefined ? { disputeWindow } : {}),
         },
         funder,
       );

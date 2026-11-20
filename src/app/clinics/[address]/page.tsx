@@ -19,6 +19,12 @@ import {
 import { trackEvent } from '@/lib/analytics';
 import { beneficiaryRef, generateKey, localIdentity } from '@/lib/beneficiary';
 import {
+  buildDisputeWindowChoices,
+  formatDisputeWindow,
+  toDisputeWindowBounds,
+  type DisputeWindowChoice,
+} from '@/lib/dispute-window';
+import {
   invalidateVouchers,
   useProvider,
   useUsdcTrustline,
@@ -46,6 +52,7 @@ import { useToast } from '@/components/Toast';
 import { Alert, Button, Card, ExplorerLink, Field } from '@/components/ui';
 import { SkeletonDetail } from '@/components/Skeleton';
 import { FavouriteButton } from '@/components/FavouriteButton';
+import { useLocaleContext } from '@/i18n/LocaleContext';
 
 /**
  * Registry status in the words a funder reads. A funder choosing a clinic
@@ -82,6 +89,7 @@ export default function ClinicPage({
 }) {
   const { address } = use(params);
   const { address: wallet, signTransaction, connect } = useWallet();
+  const { t, locale } = useLocaleContext();
   const searchParams = useSearchParams();
 
   // Validate the route parameter before it reaches any API or contract call.
@@ -151,6 +159,14 @@ export default function ClinicPage({
   const [walletBalance, setWalletBalance] = useState<bigint | null>(null);
   const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(30);
   const [customExpiry, setCustomExpiry] = useState('');
+  // The per-voucher window is optional. `null` keeps the protocol default,
+  // which is funded through the original `create_voucher`.
+  const [disputeWindowChoice, setDisputeWindowChoice] = useState<number | null>(null);
+  const [disputeWindowBounds, setDisputeWindowBounds] = useState<{
+    min: number;
+    max: number;
+  } | null>(null);
+  const [defaultDisputeWindow, setDefaultDisputeWindow] = useState<number | null>(null);
   const [generatedKey, setGeneratedKey] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [sponsored, setSponsored] = useState(false);
@@ -173,6 +189,60 @@ export default function ClinicPage({
   // button is offered, so funding never dies at signing with a raw token
   // error. `missing` swaps the fund button for a one-click fix.
   const trustline = useUsdcTrustline();
+
+  // Read the admin's bounds once. An older deployment without
+  // `get_dispute_window_bounds` leaves the default-only path untouched.
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      const [rawBounds, defaultWindow] = await Promise.all([
+        voucher.disputeWindowBounds().catch(() => null),
+        voucher.defaultDisputeWindow().catch(() => null),
+      ]);
+      if (ignore) return;
+      setDisputeWindowBounds(
+        rawBounds ? toDisputeWindowBounds(rawBounds[0], rawBounds[1]) : null,
+      );
+      setDefaultDisputeWindow(defaultWindow);
+    })();
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  const disputeWindowChoices = useMemo(
+    () =>
+      disputeWindowBounds
+        ? buildDisputeWindowChoices(disputeWindowBounds, defaultDisputeWindow)
+        : [],
+    [defaultDisputeWindow, disputeWindowBounds],
+  );
+  const selectedDisputeWindow =
+    disputeWindowChoices.find(
+      (choice) => choice.value === disputeWindowChoice,
+    ) ?? disputeWindowChoices[0] ?? null;
+  const effectiveDisputeWindow =
+    disputeWindowChoice !== null &&
+    disputeWindowChoices.some((choice) => choice.value === disputeWindowChoice)
+      ? disputeWindowChoice
+      : undefined;
+
+  function disputeWindowLabel(choice: DisputeWindowChoice): string {
+    const duration = choice.seconds
+      ? formatDisputeWindow(choice.seconds, locale)
+      : null;
+    if (choice.kind === 'default') {
+      return duration
+        ? t('clinic.disputeWindowDefault', { duration })
+        : t('clinic.disputeWindowDefaultUnknown');
+    }
+    return t(
+      choice.kind === 'shorter'
+        ? 'clinic.disputeWindowShorter'
+        : 'clinic.disputeWindowLonger',
+      { duration: duration ?? '' },
+    );
+  }
 
   useEffect(() => {
     if (!wallet) return;
@@ -213,7 +283,7 @@ export default function ClinicPage({
     } catch {
       return null;
     }
-  }, [amount]);
+  }, [amount, selectedServices.length, selectionTotal]);
 
   function toggleService(service: Service) {
     setSelectedCodes((current) => {
@@ -251,7 +321,7 @@ export default function ClinicPage({
 
   const feeRequestKey =
     wallet && baseAmount !== null && !amountError && selectedServices.length > 0
-      ? `${wallet}:${selectedServices.map((service) => `${service.code}:${selectedServices.length === 1 ? baseAmount : service.price}`).join(',')}:${expiryChoice}:${customExpiry}`
+      ? `${wallet}:${selectedServices.map((service) => `${service.code}:${selectedServices.length === 1 ? baseAmount : service.price}`).join(',')}:${expiryChoice}:${customExpiry}:${effectiveDisputeWindow ?? 'default'}`
       : null;
   const [networkFee, setNetworkFee] = useState<{
     key: string;
@@ -280,6 +350,9 @@ export default function ClinicPage({
               amount:
                 selectedServices.length === 1 ? baseAmount : BigInt(service.price),
               expiresAt,
+              ...(effectiveDisputeWindow !== undefined
+                ? { disputeWindow: effectiveDisputeWindow }
+                : {}),
             }),
           ),
         );
@@ -299,7 +372,7 @@ export default function ClinicPage({
       ignore = true;
       clearTimeout(timer);
     };
-  }, [address, baseAmount, customExpiry, expiryChoice, feeRequestKey, selectedServices, wallet]);
+  }, [address, baseAmount, customExpiry, effectiveDisputeWindow, expiryChoice, feeRequestKey, selectedServices, wallet]);
 
   const currentNetworkFee = networkFee?.key === feeRequestKey ? networkFee : null;
   const networkFeeText = !wallet
@@ -425,6 +498,9 @@ export default function ClinicPage({
       serviceCode: service.code,
       amount: singleAmount ?? BigInt(service.price),
       expiresAt,
+      ...(effectiveDisputeWindow !== undefined
+        ? { disputeWindow: effectiveDisputeWindow }
+        : {}),
     }));
 
     const succeeded: string[] = [];
@@ -968,6 +1044,7 @@ export default function ClinicPage({
                 identifier={identifier}
                 secret={secret}
                 walletAddress={wallet}
+                disputeWindow={effectiveDisputeWindow}
                 onFunded={({ hash }) => {
                   void invalidateVouchers();
                   trackEvent('voucher_funded');
@@ -1003,6 +1080,35 @@ export default function ClinicPage({
                 {selectedServices.length === 1 ? 'the voucher' : `${selectedServices.length} vouchers`}.
               </p>
             </div>
+
+            {disputeWindowChoices.length > 1 && (
+              <Field label={t('clinic.disputeWindow')}>
+                <select
+                  aria-label={t('clinic.disputeWindow')}
+                  value={disputeWindowChoice ?? 'default'}
+                  onChange={(event) =>
+                    setDisputeWindowChoice(
+                      event.target.value === 'default'
+                        ? null
+                        : Number(event.target.value),
+                    )
+                  }
+                  className="w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2 text-sm"
+                >
+                  {disputeWindowChoices.map((choice) => (
+                    <option
+                      key={choice.value ?? 'default'}
+                      value={choice.value ?? 'default'}
+                    >
+                      {disputeWindowLabel(choice)}
+                    </option>
+                  ))}
+                </select>
+                <span className="mt-1 block text-xs text-[var(--color-ink-soft)]">
+                  {t('clinic.disputeWindowHint')}
+                </span>
+              </Field>
+            )}
 
             <dl className="space-y-3 rounded-xl border border-[var(--color-line)] bg-[var(--color-canvas)] p-4 text-sm">
               <div className="flex items-start justify-between gap-3">
@@ -1054,6 +1160,16 @@ export default function ClinicPage({
                 <dt className="text-[var(--color-ink-soft)]">Expires</dt>
                 <dd className="text-end font-medium">{expirySummary}</dd>
               </div>
+              {selectedDisputeWindow && (
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-[var(--color-ink-soft)]">
+                    {t('clinic.disputeWindow')}
+                  </dt>
+                  <dd className="text-end font-medium">
+                    {disputeWindowLabel(selectedDisputeWindow)}
+                  </dd>
+                </div>
+              )}
             </dl>
 
             {useSponsor && (
